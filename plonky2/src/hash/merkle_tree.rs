@@ -130,6 +130,59 @@ fn fill_digests_buf<F: RichField, H: Hasher<F>>(
     );
 }
 
+fn update_subtree<F: RichField, H: Hasher<F>>(
+    digests_buf: &mut [H::Hash],
+    leaves: &[Vec<F>],
+) -> H::Hash {
+    assert_eq!(leaves.len(), digests_buf.len() / 2 + 1);
+    if digests_buf.is_empty() {
+        H::hash_or_noop(&leaves[0])
+    } else {
+        // Layout is: left recursive output || left child digest
+        //             || right child digest || right recursive output.
+        // Split `digests_buf` into the two recursive outputs (slices) and two child digests
+        // (references).
+        let (left_digests_buf, right_digests_buf) = digests_buf.split_at_mut(digests_buf.len() / 2);
+        let (left_digest_mem, left_digests_buf) = left_digests_buf.split_last_mut().unwrap();
+        let (right_digest_mem, right_digests_buf) = right_digests_buf.split_first_mut().unwrap();
+        // Split `leaves` between both children.
+        let (left_leaves, right_leaves) = leaves.split_at(leaves.len() / 2);
+
+        let (left_digest, right_digest) = maybe_rayon::join(
+            || update_subtree::<F, H>(left_digests_buf, left_leaves),
+            || update_subtree::<F, H>(right_digests_buf, right_leaves),
+        );
+
+        *left_digest_mem = left_digest;
+        *right_digest_mem = right_digest;
+        H::two_to_one(left_digest, right_digest)
+    }
+}
+
+pub fn update_digests<F: RichField, H: Hasher<F>>(
+    digest: &mut Vec<H::Hash>,
+    cap: &mut Vec<H::Hash>,
+    leaves: &mut [Vec<F>],
+    cap_height: usize,
+) {
+    // for each sub tree o
+    let subtree_digests_len = digest.len() >> cap_height;
+    let subtree_leaves_len = leaves.len() >> cap_height;
+    let digests_chunks = digest.par_chunks_exact_mut(subtree_digests_len);
+    let leaves_chunks = leaves.par_chunks_exact_mut(subtree_leaves_len);
+    assert_eq!(digests_chunks.len(), cap.len());
+    assert_eq!(digests_chunks.len(), leaves_chunks.len());
+    // digest_chunks.zip(cap_buf)
+    digests_chunks.zip(cap).zip(leaves_chunks).for_each(
+        |((subtree_digests, subtree_cap), subtree_leaves)| {
+            // We have `1 << cap_height` sub-trees, one for each entry in `cap`. They are totally
+            // independent, so we schedule one task for each. `digests_buf` and `leaves` are split
+            // into `1 << cap_height` slices, one for each sub-tree.
+            *subtree_cap = update_subtree::<F, H>(subtree_digests, subtree_leaves);
+        },
+    );
+}
+
 impl<F: RichField, H: Hasher<F>> MerkleTree<F, H> {
     pub fn new(leaves: Vec<Vec<F>>, cap_height: usize) -> Self {
         let log2_leaves_len = log2_strict(leaves.len());
@@ -163,6 +216,21 @@ impl<F: RichField, H: Hasher<F>> MerkleTree<F, H> {
             cap: MerkleCap(cap),
         }
     }
+
+    pub fn update(&mut self, leave: Vec<F>, index: usize, cap_height: usize) {
+        assert!(
+            index < self.leaves.len(),
+            "can only update, no append (index < tree length)",
+        );
+        self.leaves[index] = leave;
+        update_digests::<F, H>(
+            self.digests.as_mut(),
+            &mut self.cap.0,
+            self.leaves.as_mut(),
+            cap_height,
+        );
+    }
+
 
     pub fn get(&self, i: usize) -> &[F] {
         &self.leaves[i]
