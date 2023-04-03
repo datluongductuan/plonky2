@@ -21,10 +21,9 @@ in the Plonky2 directory.
 
 ## Running
 
-To see recursion performance, one can run this bench, which generates a chain of three recursion proofs:
-
+To run private tx and gen circom, please run:
 ```sh
-RUSTFLAGS=-Ctarget-cpu=native cargo run --release --example bench_recursion -- -vv
+RUST_BACKTRACE=1 RUST_LOG="info" cargo run --color=always --example private_tx --release
 ```
 
 ## Jemalloc
